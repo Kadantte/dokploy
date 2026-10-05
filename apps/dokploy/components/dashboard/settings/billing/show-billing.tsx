@@ -2,12 +2,15 @@ import { loadStripe } from "@stripe/stripe-js";
 import clsx from "clsx";
 import {
 	AlertTriangle,
+	Bell,
 	CheckIcon,
+	Clock,
 	CreditCard,
 	FileText,
 	Loader2,
 	MinusIcon,
 	PlusIcon,
+	ShieldCheck,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/router";
@@ -23,8 +26,18 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogHeader,
+	DialogTitle,
+	DialogTrigger,
+} from "@/components/ui/dialog";
 import { NumberInput } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { api } from "@/utils/api";
@@ -81,6 +94,7 @@ export const ShowBilling = () => {
 	const router = useRouter();
 	const { data: servers } = api.server.count.useQuery();
 	const { data: admin } = api.user.get.useQuery();
+	const { data: billingStatus } = api.stripe.getBillingStatus.useQuery();
 	const { data, isPending } = api.stripe.getProducts.useQuery();
 	const { mutateAsync: createCheckoutSession } =
 		api.stripe.createCheckoutSession.useMutation();
@@ -89,7 +103,69 @@ export const ShowBilling = () => {
 		api.stripe.createCustomerPortalSession.useMutation();
 	const { mutateAsync: upgradeSubscription, isPending: isUpgrading } =
 		api.stripe.upgradeSubscription.useMutation();
+	const { mutateAsync: updateInvoiceNotifications } =
+		api.stripe.updateInvoiceNotifications.useMutation();
+	const { mutateAsync: startFreeTrial } =
+		api.stripe.startFreeTrial.useMutation();
 	const utils = api.useUtils();
+	const [trialTier, setTrialTier] = useState<"hobby" | "startup" | null>(null);
+	const [switchingTrial, setSwitchingTrial] = useState(false);
+
+	const handleSwitchTrialPlan = async (
+		tier: "hobby" | "startup",
+		isAnnualPlan: boolean,
+		label?: string,
+	) => {
+		const planName =
+			label ??
+			`${tier === "startup" ? "Startup" : "Hobby"} ${isAnnualPlan ? "annual" : "monthly"}`;
+
+		const switchPlan = async () => {
+			await upgradeSubscription({
+				tier,
+				serverQuantity: tier === "startup" ? STARTUP_SERVERS_INCLUDED : 1,
+				isAnnual: isAnnualPlan,
+			});
+			await new Promise((resolve) => setTimeout(resolve, 3000));
+			await Promise.all([
+				utils.stripe.getBillingStatus.invalidate(),
+				utils.stripe.getProducts.invalidate(),
+				utils.user.get.invalidate(),
+				utils.server.count.invalidate(),
+			]);
+		};
+
+		setSwitchingTrial(true);
+		await toast
+			.promise(switchPlan(), {
+				loading: `Switching to ${planName}...`,
+				success: `Your trial is now on ${planName}`,
+				error: (error) =>
+					error instanceof Error ? error.message : "Error switching plan",
+			})
+			.unwrap()
+			.catch(() => undefined);
+		setSwitchingTrial(false);
+	};
+
+	const handleStartTrial = async (tier: "hobby" | "startup") => {
+		setTrialTier(tier);
+		try {
+			await startFreeTrial({ tier });
+			await Promise.all([
+				utils.stripe.getBillingStatus.invalidate(),
+				utils.stripe.getProducts.invalidate(),
+				utils.user.get.invalidate(),
+			]);
+			toast.success("Your 7-day trial has started");
+		} catch (error) {
+			toast.error(
+				error instanceof Error ? error.message : "Error starting trial",
+			);
+		} finally {
+			setTrialTier(null);
+		}
+	};
 
 	const [hobbyServerQuantity, setHobbyServerQuantity] = useState(1);
 	const [startupServerQuantity, setStartupServerQuantity] = useState(
@@ -136,11 +212,23 @@ export const ShowBilling = () => {
 
 	const useNewPricing = data?.hobbyProductId && data?.startupProductId;
 	const products = data?.products.filter((product) => {
-		// @ts-ignore
+		// @ts-expect-error
 		const interval = product?.default_price?.recurring?.interval;
 		return isAnnual ? interval === "year" : interval === "month";
 	});
 
+	const isEnterpriseCloud = admin?.user.isEnterpriseCloud ?? false;
+	const canStartTrial =
+		!isEnterpriseCloud &&
+		!!billingStatus &&
+		!billingStatus.plan &&
+		!billingStatus.isOnTrial &&
+		!billingStatus.hasUsedTrial;
+	/** Checkout would create a second subscription alongside a running trial. */
+	const canSubscribe =
+		!isEnterpriseCloud &&
+		(data?.subscriptions?.length ?? 0) === 0 &&
+		!billingStatus?.isOnTrial;
 	const maxServers = admin?.user.serversQuantity ?? 1;
 	const percentage = ((servers ?? 0) / maxServers) * 100;
 	const safePercentage = Math.min(percentage, 100);
@@ -149,14 +237,66 @@ export const ShowBilling = () => {
 		<div className="w-full">
 			<Card className="bg-sidebar p-2.5 rounded-xl max-w-6xl mx-auto">
 				<div className="rounded-xl bg-background shadow-md">
-					<CardHeader>
-						<CardTitle className="text-xl flex flex-row gap-2">
-							<CreditCard className="size-6 text-muted-foreground self-center" />
-							Billing
-						</CardTitle>
-						<CardDescription>
-							Manage your subscription and invoices
-						</CardDescription>
+					<CardHeader className="flex flex-row items-start justify-between">
+						<div>
+							<CardTitle className="text-xl flex flex-row gap-2">
+								<CreditCard className="size-6 text-muted-foreground self-center" />
+								Billing
+							</CardTitle>
+							<CardDescription>
+								Manage your subscription and invoices
+							</CardDescription>
+						</div>
+						{(admin?.user.stripeSubscriptionId || isEnterpriseCloud) && (
+							<Dialog>
+								<DialogTrigger asChild>
+									<Button variant="outline" size="icon">
+										<Bell className="size-4" />
+									</Button>
+								</DialogTrigger>
+								<DialogContent className="sm:max-w-md">
+									<DialogHeader>
+										<DialogTitle>Notification Settings</DialogTitle>
+										<DialogDescription>
+											Configure your billing email notifications.
+										</DialogDescription>
+									</DialogHeader>
+									<div className="flex items-center justify-between rounded-lg border p-4">
+										<div className="space-y-0.5">
+											<Label htmlFor="invoice-notifications">
+												Invoice Notifications
+											</Label>
+											<p className="text-sm text-muted-foreground">
+												Receive email notifications for payments and failed
+												charges.
+											</p>
+										</div>
+										<Switch
+											id="invoice-notifications"
+											checked={admin?.user.sendInvoiceNotifications ?? false}
+											onCheckedChange={async (checked) => {
+												await updateInvoiceNotifications({
+													enabled: checked,
+												})
+													.then(() => {
+														utils.user.get.invalidate();
+														toast.success(
+															checked
+																? "Invoice notifications enabled"
+																: "Invoice notifications disabled",
+														);
+													})
+													.catch(() => {
+														toast.error(
+															"Failed to update invoice notifications",
+														);
+													});
+											}}
+										/>
+									</div>
+								</DialogContent>
+							</Dialog>
+						)}
 					</CardHeader>
 					<CardContent className="space-y-4 py-4 border-t">
 						<nav className="flex space-x-2 border-b">
@@ -182,7 +322,127 @@ export const ShowBilling = () => {
 						</nav>
 
 						<div className="flex flex-col gap-4 w-full mt-6">
-							{admin?.user.stripeSubscriptionId && (
+							{!isEnterpriseCloud &&
+								billingStatus &&
+								(billingStatus.plan || billingStatus.isOnTrial) && (
+									<div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border p-4 max-w-2xl">
+										<div className="flex items-center gap-3">
+											{billingStatus.isOnTrial ? (
+												<Clock className="h-5 w-5 text-primary shrink-0" />
+											) : (
+												<CreditCard className="h-5 w-5 text-primary shrink-0" />
+											)}
+											<div className="flex flex-col">
+												<div className="flex items-center gap-2">
+													<span className="text-sm font-medium">
+														{billingStatus.isOnTrial
+															? "Free trial"
+															: "Current plan"}
+													</span>
+													<Badge className="capitalize" variant="secondary">
+														{billingStatus.plan ?? "Trial"}
+													</Badge>
+													{billingStatus.plan && (
+														<Badge variant="outline">
+															{billingStatus.isAnnual ? "Annual" : "Monthly"}
+														</Badge>
+													)}
+												</div>
+												<span className="text-sm text-muted-foreground">
+													{billingStatus.isOnTrial
+														? `${billingStatus.trialDaysRemaining} day${billingStatus.trialDaysRemaining === 1 ? "" : "s"} left${
+																billingStatus.trialEndsAt
+																	? ` · ends ${new Date(billingStatus.trialEndsAt).toLocaleDateString()}`
+																	: ""
+															}${
+																billingStatus.hasPaymentMethod
+																	? " · billing starts automatically"
+																	: " · add a card to keep your servers"
+															}`
+														: "You're subscribed and billed automatically."}
+												</span>
+											</div>
+										</div>
+										{admin?.user.stripeCustomerId && (
+											<div className="flex flex-wrap items-center gap-2">
+												{billingStatus.isOnTrial &&
+													useNewPricing &&
+													billingStatus.plan &&
+													billingStatus.plan !== "legacy" && (
+														<>
+															<Button
+																size="sm"
+																variant="outline"
+																isLoading={switchingTrial}
+																onClick={() =>
+																	handleSwitchTrialPlan(
+																		billingStatus.plan === "startup"
+																			? "hobby"
+																			: "startup",
+																		billingStatus.isAnnual,
+																	)
+																}
+															>
+																{billingStatus.plan === "startup"
+																	? "Switch to Hobby"
+																	: "Switch to Startup"}
+															</Button>
+															<Button
+																size="sm"
+																variant="outline"
+																isLoading={switchingTrial}
+																onClick={() =>
+																	handleSwitchTrialPlan(
+																		billingStatus.plan as "hobby" | "startup",
+																		!billingStatus.isAnnual,
+																		billingStatus.isAnnual
+																			? "monthly billing"
+																			: "annual billing",
+																	)
+																}
+															>
+																{billingStatus.isAnnual
+																	? "Switch to monthly"
+																	: "Switch to annual"}
+															</Button>
+														</>
+													)}
+												<Button
+													size="sm"
+													variant={
+														billingStatus.isOnTrial &&
+														!billingStatus.hasPaymentMethod
+															? "default"
+															: "secondary"
+													}
+													onClick={async () => {
+														const session = await createCustomerPortalSession();
+														window.open(session.url);
+													}}
+												>
+													{billingStatus.isOnTrial &&
+													!billingStatus.hasPaymentMethod
+														? "Add payment method"
+														: "Manage Subscription"}
+												</Button>
+											</div>
+										)}
+									</div>
+								)}
+							{canStartTrial && (
+								<div className="flex items-center gap-3 rounded-xl border border-primary/30 bg-primary/5 p-4 max-w-2xl">
+									<Clock className="h-5 w-5 text-primary shrink-0" />
+									<div className="flex flex-col">
+										<span className="text-sm font-medium">
+											7-day free trial on any plan
+										</span>
+										<span className="text-sm text-muted-foreground">
+											No credit card required — pick Hobby or Startup below.
+										</span>
+									</div>
+								</div>
+							)}
+							{(admin?.user.stripeSubscriptionId || isEnterpriseCloud) && (
 								<div className="space-y-2 flex flex-col">
 									<h3 className="text-lg font-medium">Servers Plan</h3>
 									<p className="text-sm text-muted-foreground">
@@ -203,8 +463,36 @@ export const ShowBilling = () => {
 									)}
 								</div>
 							)}
+							{isEnterpriseCloud && (
+								<div className="flex items-start gap-3 rounded-xl border border-primary/30 bg-primary/5 p-4 max-w-2xl">
+									<ShieldCheck className="h-6 w-6 text-primary shrink-0 mt-0.5" />
+									<div className="flex flex-col gap-1">
+										<h3 className="text-base font-semibold text-foreground">
+											Enterprise Cloud Plan
+										</h3>
+										<p className="text-sm text-muted-foreground">
+											Your organization is on a managed Enterprise plan. Billing
+											is handled separately — contact your account manager for
+											any changes.
+										</p>
+										{admin?.user.stripeCustomerId && (
+											<Button
+												variant="secondary"
+												className="w-fit mt-2"
+												onClick={async () => {
+													const session = await createCustomerPortalSession();
+													window.open(session.url);
+												}}
+											>
+												Manage Subscription
+											</Button>
+										)}
+									</div>
+								</div>
+							)}
 							{/* Upgrade: solo para usuarios en plan legacy con nuevos planes disponibles */}
-							{useNewPricing &&
+							{!isEnterpriseCloud &&
+								useNewPricing &&
 								data?.currentPlan === "legacy" &&
 								data?.subscriptions?.length > 0 && (
 									<div className="rounded-xl border border-border bg-primary/5 p-4 space-y-4 max-w-2xl">
@@ -222,7 +510,7 @@ export const ShowBilling = () => {
 											<Button
 												variant={!updateFormAnnual ? "default" : "outline"}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpdateFormAnnual(false)}
 											>
 												Monthly
@@ -230,7 +518,7 @@ export const ShowBilling = () => {
 											<Button
 												variant={updateFormAnnual ? "default" : "outline"}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpdateFormAnnual(true)}
 											>
 												Annual (20% off)
@@ -244,7 +532,7 @@ export const ShowBilling = () => {
 													upgradeTier === "hobby" ? "default" : "outline"
 												}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpgradeTier("hobby")}
 											>
 												Hobby
@@ -254,7 +542,7 @@ export const ShowBilling = () => {
 													upgradeTier === "startup" ? "default" : "outline"
 												}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpgradeTier("startup")}
 											>
 												Startup
@@ -394,7 +682,8 @@ export const ShowBilling = () => {
 									</div>
 								)}
 							{/* Cambiar plan o cantidad de servidores (usuarios en Hobby o Startup; el portal no permite esto) */}
-							{useNewPricing &&
+							{!isEnterpriseCloud &&
+								useNewPricing &&
 								(data?.currentPlan === "hobby" ||
 									data?.currentPlan === "startup") &&
 								data?.subscriptions?.length > 0 && (
@@ -436,7 +725,7 @@ export const ShowBilling = () => {
 											<Button
 												variant={!updateFormAnnual ? "default" : "outline"}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpdateFormAnnual(false)}
 											>
 												Monthly
@@ -444,7 +733,7 @@ export const ShowBilling = () => {
 											<Button
 												variant={updateFormAnnual ? "default" : "outline"}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpdateFormAnnual(true)}
 											>
 												Annual (20% off)
@@ -458,7 +747,7 @@ export const ShowBilling = () => {
 													upgradeTier === "hobby" ? "default" : "outline"
 												}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpgradeTier("hobby")}
 											>
 												Hobby
@@ -468,7 +757,7 @@ export const ShowBilling = () => {
 													upgradeTier === "startup" ? "default" : "outline"
 												}
 												size="sm"
-												className="min-w-[6rem]"
+												className="min-w-24"
 												onClick={() => setUpgradeTier("startup")}
 											>
 												Startup
@@ -672,7 +961,7 @@ export const ShowBilling = () => {
 									</Tabs>
 									<div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
 										{/* Hobby */}
-										<section className="flex flex-col rounded-2xl border border-border px-5 py-6 shadow-sm">
+										<section className="flex flex-col rounded-2xl border border-border px-5 py-6 shadow-xs">
 											{isAnnual && (
 												<Badge className="mb-3 w-fit" variant="secondary">
 													20% off
@@ -713,7 +1002,7 @@ export const ShowBilling = () => {
 													"Unlimited Deployments",
 													"Unlimited Databases",
 													"Unlimited Applications",
-													"1 Server Included",
+													"Setup 1 Server",
 													"1 Organization",
 													"1 User",
 													"2 Environments",
@@ -729,59 +1018,63 @@ export const ShowBilling = () => {
 												))}
 											</ul>
 											<div className="mt-6 flex flex-col gap-3">
-												<div className="flex items-center gap-2">
-													<span className="text-sm text-muted-foreground">
-														Servers:
-													</span>
-													<Button
-														disabled={hobbyServerQuantity <= 1}
-														variant="outline"
-														size="icon"
-														onClick={() =>
-															setHobbyServerQuantity((q) => Math.max(1, q - 1))
-														}
-													>
-														<MinusIcon className="h-4 w-4" />
-													</Button>
-													<NumberInput
-														value={hobbyServerQuantity}
-														onChange={(e) =>
-															setHobbyServerQuantity(
-																Math.max(
-																	1,
-																	Number(
-																		(e.target as HTMLInputElement).value,
-																	) || 1,
-																),
-															)
-														}
-														className="text-center"
-													/>
-													<Button
-														variant="outline"
-														size="icon"
-														onClick={() => setHobbyServerQuantity((q) => q + 1)}
-													>
-														<PlusIcon className="h-4 w-4" />
-													</Button>
-												</div>
-												<div className="flex flex-col gap-2 w-full">
-													{admin?.user.stripeCustomerId && (
+												{canSubscribe && (
+													<div className="flex items-center gap-2">
+														<span className="text-sm text-muted-foreground">
+															Servers:
+														</span>
 														<Button
-															variant="secondary"
-															className="w-full"
-															onClick={async () => {
-																const session =
-																	await createCustomerPortalSession();
-																window.open(session.url);
-															}}
+															disabled={hobbyServerQuantity <= 1}
+															variant="outline"
+															size="icon"
+															onClick={() =>
+																setHobbyServerQuantity((q) =>
+																	Math.max(1, q - 1),
+																)
+															}
 														>
-															Manage Subscription
+															<MinusIcon className="h-4 w-4" />
+														</Button>
+														<NumberInput
+															value={hobbyServerQuantity}
+															onChange={(e) =>
+																setHobbyServerQuantity(
+																	Math.max(
+																		1,
+																		Number(
+																			(e.target as HTMLInputElement).value,
+																		) || 1,
+																	),
+																)
+															}
+															className="text-center"
+														/>
+														<Button
+															variant="outline"
+															size="icon"
+															onClick={() =>
+																setHobbyServerQuantity((q) => q + 1)
+															}
+														>
+															<PlusIcon className="h-4 w-4" />
+														</Button>
+													</div>
+												)}
+												<div className="flex flex-col gap-2 w-full">
+													{canStartTrial && (
+														<Button
+															className="w-full"
+															isLoading={trialTier === "hobby"}
+															disabled={trialTier !== null}
+															onClick={() => handleStartTrial("hobby")}
+														>
+															Start 7-day free trial
 														</Button>
 													)}
-													{(data?.subscriptions?.length ?? 0) === 0 && (
+													{canSubscribe && (
 														<Button
 															className="w-full"
+															variant={canStartTrial ? "outline" : "default"}
 															onClick={() =>
 																handleCheckout("hobby", data!.hobbyProductId!)
 															}
@@ -795,7 +1088,7 @@ export const ShowBilling = () => {
 										</section>
 
 										{/* Startup - Recommended */}
-										<section className="flex flex-col rounded-2xl border-2 border-primary px-5 py-6 shadow-sm">
+										<section className="flex flex-col rounded-2xl border-2 border-primary px-5 py-6 shadow-xs">
 											<div className="mb-3 flex flex-wrap gap-2">
 												<Badge className="w-fit" variant="default">
 													Recommended
@@ -844,7 +1137,7 @@ export const ShowBilling = () => {
 													All the features of Hobby, plus…
 												</li>
 												{[
-													"3 Servers Included",
+													"Setup up to 3 Servers",
 													"3 Organizations",
 													"Unlimited Users",
 													"Unlimited Environments",
@@ -862,70 +1155,70 @@ export const ShowBilling = () => {
 												))}
 											</ul>
 											<div className="mt-6 flex flex-col gap-3">
-												<div className="flex flex-col gap-2">
-													<span className="text-sm font-medium text-foreground">
-														Servers (min. {STARTUP_SERVERS_INCLUDED} included)
-													</span>
-													<div className="flex items-center gap-2">
-														<Button
-															disabled={
-																startupServerQuantity <=
-																STARTUP_SERVERS_INCLUDED
-															}
-															variant="outline"
-															size="icon"
-															className="h-8 w-8"
-															onClick={() =>
-																setStartupServerQuantity((q) =>
-																	Math.max(STARTUP_SERVERS_INCLUDED, q - 1),
-																)
-															}
-														>
-															<MinusIcon className="h-4 w-4" />
-														</Button>
-														<NumberInput
-															value={startupServerQuantity}
-															onChange={(e) =>
-																setStartupServerQuantity(
-																	Math.max(
-																		STARTUP_SERVERS_INCLUDED,
-																		Number(
-																			(e.target as HTMLInputElement).value,
-																		) || STARTUP_SERVERS_INCLUDED,
-																	),
-																)
-															}
-															className="h-8 text-center"
-														/>
-														<Button
-															variant="outline"
-															size="icon"
-															className="h-8 w-8"
-															onClick={() =>
-																setStartupServerQuantity((q) => q + 1)
-															}
-														>
-															<PlusIcon className="h-4 w-4" />
-														</Button>
+												{canSubscribe && (
+													<div className="flex flex-col gap-2">
+														<span className="text-sm font-medium text-foreground">
+															Servers (min. {STARTUP_SERVERS_INCLUDED} included)
+														</span>
+														<div className="flex items-center gap-2">
+															<Button
+																disabled={
+																	startupServerQuantity <=
+																	STARTUP_SERVERS_INCLUDED
+																}
+																variant="outline"
+																size="icon"
+																className="h-8 w-8"
+																onClick={() =>
+																	setStartupServerQuantity((q) =>
+																		Math.max(STARTUP_SERVERS_INCLUDED, q - 1),
+																	)
+																}
+															>
+																<MinusIcon className="h-4 w-4" />
+															</Button>
+															<NumberInput
+																value={startupServerQuantity}
+																onChange={(e) =>
+																	setStartupServerQuantity(
+																		Math.max(
+																			STARTUP_SERVERS_INCLUDED,
+																			Number(
+																				(e.target as HTMLInputElement).value,
+																			) || STARTUP_SERVERS_INCLUDED,
+																		),
+																	)
+																}
+																className="h-8 text-center"
+															/>
+															<Button
+																variant="outline"
+																size="icon"
+																className="h-8 w-8"
+																onClick={() =>
+																	setStartupServerQuantity((q) => q + 1)
+																}
+															>
+																<PlusIcon className="h-4 w-4" />
+															</Button>
+														</div>
 													</div>
-												</div>
+												)}
 												<div className="flex flex-col gap-2 w-full">
-													{admin?.user.stripeCustomerId && (
+													{canStartTrial && (
 														<Button
-															variant="secondary"
 															className="w-full"
-															onClick={async () => {
-																const session =
-																	await createCustomerPortalSession();
-																window.open(session.url);
-															}}
+															isLoading={trialTier === "startup"}
+															disabled={trialTier !== null}
+															onClick={() => handleStartTrial("startup")}
 														>
-															Manage Subscription
+															Start 7-day free trial
 														</Button>
 													)}
-													{(data?.subscriptions?.length ?? 0) === 0 && (
+													{canSubscribe && (
 														<Button
 															className="w-full"
+															variant={canStartTrial ? "outline" : "default"}
 															onClick={() =>
 																handleCheckout(
 																	"startup",
@@ -944,7 +1237,7 @@ export const ShowBilling = () => {
 										</section>
 
 										{/* Enterprise */}
-										<section className="flex flex-col rounded-2xl border border-border px-5 py-6 shadow-sm">
+										<section className="flex flex-col rounded-2xl border border-border px-5 py-6 shadow-xs">
 											<h3 className="text-xl font-bold tracking-tight text-foreground">
 												Enterprise
 											</h3>
@@ -998,7 +1291,7 @@ export const ShowBilling = () => {
 										className="w-full"
 										onValueChange={(e) => setIsAnnual(e === "annual")}
 									>
-										<TabsList className="grid w-full max-w-[14rem] grid-cols-2">
+										<TabsList className="grid w-full max-w-56 grid-cols-2">
 											<TabsTrigger value="monthly">Monthly</TabsTrigger>
 											<TabsTrigger value="annual">Annual (20% off)</TabsTrigger>
 										</TabsList>
@@ -1011,7 +1304,7 @@ export const ShowBilling = () => {
 													className={clsx(
 														"flex flex-col rounded-3xl  border-dashed border-2 px-4 max-w-sm",
 														featured
-															? "order-first  border py-8 lg:order-none"
+															? "order-first  border py-8 lg:order-0"
 															: "lg:py-8",
 													)}
 												>
@@ -1130,20 +1423,7 @@ export const ShowBilling = () => {
 															</Button>
 														</div>
 														<div className="flex flex-col gap-2 mt-4 w-full">
-															{admin?.user.stripeCustomerId && (
-																<Button
-																	variant="secondary"
-																	className="w-full"
-																	onClick={async () => {
-																		const session =
-																			await createCustomerPortalSession();
-																		window.open(session.url);
-																	}}
-																>
-																	Manage Subscription
-																</Button>
-															)}
-															{(data?.subscriptions?.length ?? 0) === 0 && (
+															{canSubscribe && (
 																<Button
 																	className="w-full"
 																	onClick={async () => {

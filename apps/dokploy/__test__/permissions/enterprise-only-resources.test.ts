@@ -1,8 +1,8 @@
-import { describe, it, expect } from "vitest";
 import {
 	enterpriseOnlyResources,
 	statements,
 } from "@dokploy/server/lib/access-control";
+import { describe, expect, it } from "vitest";
 
 const FREE_TIER_RESOURCES = [
 	"organization",
@@ -35,9 +35,12 @@ const ENTERPRISE_RESOURCES = [
 	"domain",
 	"destination",
 	"notification",
+	"tag",
 	"logs",
 	"monitoring",
 	"auditLog",
+	"vaultProvider",
+	"dnsProvider",
 ];
 
 describe("enterpriseOnlyResources set", () => {

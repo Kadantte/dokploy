@@ -1,10 +1,4 @@
-import {
-	ClipboardList,
-	Database,
-	DatabaseBackup,
-	Play,
-	Trash2,
-} from "lucide-react";
+import { ClipboardList, DatabaseBackup, Play, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -53,14 +47,16 @@ export const ShowBackups = ({
 	const queryMap =
 		backupType === "database"
 			? {
-					postgres: () =>
-						api.postgres.one.useQuery({ postgresId: id }, { enabled: !!id }),
-					mysql: () =>
-						api.mysql.one.useQuery({ mysqlId: id }, { enabled: !!id }),
 					mariadb: () =>
 						api.mariadb.one.useQuery({ mariadbId: id }, { enabled: !!id }),
 					mongo: () =>
 						api.mongo.one.useQuery({ mongoId: id }, { enabled: !!id }),
+					mysql: () =>
+						api.mysql.one.useQuery({ mysqlId: id }, { enabled: !!id }),
+					postgres: () =>
+						api.postgres.one.useQuery({ postgresId: id }, { enabled: !!id }),
+					libsql: () =>
+						api.libsql.one.useQuery({ libsqlId: id }, { enabled: !!id }),
 					"web-server": () => api.user.getBackups.useQuery(),
 				}
 			: {
@@ -77,10 +73,11 @@ export const ShowBackups = ({
 	const mutationMap =
 		backupType === "database"
 			? {
-					postgres: api.backup.manualBackupPostgres.useMutation(),
-					mysql: api.backup.manualBackupMySql.useMutation(),
 					mariadb: api.backup.manualBackupMariadb.useMutation(),
 					mongo: api.backup.manualBackupMongo.useMutation(),
+					mysql: api.backup.manualBackupMySql.useMutation(),
+					postgres: api.backup.manualBackupPostgres.useMutation(),
+					libsql: api.backup.manualBackupLibsql.useMutation(),
 					"web-server": api.backup.manualBackupWebServer.useMutation(),
 				}
 			: {
@@ -98,12 +95,9 @@ export const ShowBackups = ({
 
 	return (
 		<Card className="bg-background">
-			<CardHeader className="flex flex-row justify-between gap-4  flex-wrap">
-				<div className="flex flex-col gap-0.5">
-					<CardTitle className="text-xl flex flex-row gap-2">
-						<Database className="size-6 text-muted-foreground" />
-						Backups
-					</CardTitle>
+			<CardHeader className="flex flex-row items-center flex-wrap gap-4 justify-between">
+				<div className="flex flex-col gap-1">
+					<CardTitle className="text-xl">Backups</CardTitle>
 					<CardDescription>
 						Add backups to your database to save the data to a different
 						provider.

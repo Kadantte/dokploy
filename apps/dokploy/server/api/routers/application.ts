@@ -1,12 +1,17 @@
 import {
 	clearOldDeployments,
 	createApplication,
+	createDomain,
 	deleteAllMiddlewares,
 	findApplicationById,
 	findEnvironmentById,
-	findGitProviderById,
+	findPreviewDeploymentsByApplicationId,
 	findProjectById,
+	generateTraefikMeDomain,
+	getAccessibleServerIds,
 	getApplicationStats,
+	getContainerLogs,
+	getWebServerSettings,
 	IS_CLOUD,
 	mechanizeDockerContainer,
 	readConfig,
@@ -14,6 +19,7 @@ import {
 	removeDeployments,
 	removeDirectoryCode,
 	removeMonitoringDirectory,
+	removePreviewDeployment,
 	removeService,
 	removeTraefikConfig,
 	startService,
@@ -28,6 +34,7 @@ import {
 	writeConfigRemote,
 } from "@dokploy/server";
 import { db } from "@dokploy/server/db";
+import { canEditDeployGitSource } from "@dokploy/server/services/git-provider";
 import {
 	addNewService,
 	checkServiceAccess,
@@ -65,11 +72,9 @@ import {
 	environments,
 	projects,
 } from "@/server/db/schema";
-import { deploymentWorker } from "@/server/queues/deployments-queue";
 import type { DeploymentJob } from "@/server/queues/queue-types";
 import {
 	cleanQueuesByApplication,
-	getJobsByApplicationId,
 	killDockerBuild,
 	myQueue,
 } from "@/server/queues/queueSetup";
@@ -85,7 +90,11 @@ export const applicationRouter = createTRPCRouter({
 
 				await checkServiceAccess(ctx, project.projectId, "create");
 
-				if (IS_CLOUD && !input.serverId) {
+				const webServerSettings = await getWebServerSettings();
+				if (
+					(IS_CLOUD || webServerSettings?.remoteServersOnly) &&
+					!input.serverId
+				) {
 					throw new TRPCError({
 						code: "UNAUTHORIZED",
 						message: "You need to use a server to create an application",
@@ -97,6 +106,16 @@ export const applicationRouter = createTRPCRouter({
 						code: "UNAUTHORIZED",
 						message: "You are not authorized to access this project",
 					});
+				}
+
+				if (input.serverId) {
+					const accessibleIds = await getAccessibleServerIds(ctx.session);
+					if (!accessibleIds.has(input.serverId)) {
+						throw new TRPCError({
+							code: "UNAUTHORIZED",
+							message: "You are not authorized to access this server",
+						});
+					}
 				}
 
 				const newApplication = await createApplication(input);
@@ -121,6 +140,118 @@ export const applicationRouter = createTRPCRouter({
 				});
 			}
 		}),
+
+	deployNginxQuickstart: protectedProcedure
+		.input(
+			z.object({
+				environmentId: z.string().min(1),
+				serverId: z.string().min(1).optional(),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			const environment = await findEnvironmentById(input.environmentId);
+			const project = await findProjectById(environment.projectId);
+
+			await checkServiceAccess(ctx, project.projectId, "create");
+
+			if (project.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to access this project",
+				});
+			}
+
+			if (IS_CLOUD && !input.serverId) {
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "You need to use a server to create an application",
+				});
+			}
+
+			if (input.serverId) {
+				const accessibleIds = await getAccessibleServerIds(ctx.session);
+				if (!accessibleIds.has(input.serverId)) {
+					throw new TRPCError({
+						code: "UNAUTHORIZED",
+						message: "You are not authorized to access this server",
+					});
+				}
+			}
+
+			const suffix = nanoid(6).toLowerCase();
+			const newApplication = await createApplication({
+				name: "Hello World",
+				appName: `hello-world-${suffix}`,
+				description: "Nginx demo app created by the onboarding wizard",
+				environmentId: input.environmentId,
+				serverId: input.serverId,
+				sourceType: "docker",
+			});
+
+			await addNewService(ctx, newApplication.applicationId);
+
+			await updateApplication(newApplication.applicationId, {
+				dockerImage: "nginxdemos/hello",
+				sourceType: "docker",
+				applicationStatus: "idle",
+			});
+
+			const host = await generateTraefikMeDomain(
+				newApplication.appName,
+				ctx.user.ownerId,
+				input.serverId,
+			);
+
+			const domain = await createDomain({
+				host,
+				port: 80,
+				https: false,
+				applicationId: newApplication.applicationId,
+				domainType: "application",
+			});
+
+			await audit(ctx, {
+				action: "create",
+				resourceType: "service",
+				resourceId: newApplication.applicationId,
+				resourceName: newApplication.appName,
+			});
+
+			const jobData: DeploymentJob = {
+				applicationId: newApplication.applicationId,
+				titleLog: "Onboarding quickstart deployment",
+				descriptionLog: "",
+				type: "deploy",
+				applicationType: "application",
+				server: !!input.serverId,
+				serverId: input.serverId,
+			};
+
+			if (IS_CLOUD && input.serverId) {
+				deploy(jobData).catch((error) => {
+					console.error("Background deployment failed:", error);
+				});
+			} else {
+				await myQueue.add(
+					"deployments",
+					{ ...jobData },
+					{ removeOnComplete: true, removeOnFail: true },
+				);
+			}
+
+			await audit(ctx, {
+				action: "deploy",
+				resourceType: "application",
+				resourceId: newApplication.applicationId,
+				resourceName: newApplication.appName,
+			});
+
+			return {
+				applicationId: newApplication.applicationId,
+				domainUrl: `http://${domain.host}`,
+			};
+		}),
+
 	one: protectedProcedure
 		.input(apiFindOneApplication)
 		.query(async ({ input, ctx }) => {
@@ -157,13 +288,11 @@ export const applicationRouter = createTRPCRouter({
 			const gitProviderId = getGitProviderId();
 
 			if (gitProviderId) {
-				try {
-					const gitProvider = await findGitProviderById(gitProviderId);
-					if (gitProvider.userId !== ctx.session.userId) {
-						hasGitProviderAccess = false;
-						unauthorizedProvider = application.sourceType;
-					}
-				} catch {
+				const canEdit = await canEditDeployGitSource(
+					gitProviderId,
+					ctx.session,
+				);
+				if (!canEdit) {
 					hasGitProviderAccess = false;
 					unauthorizedProvider = application.sourceType;
 				}
@@ -221,18 +350,22 @@ export const applicationRouter = createTRPCRouter({
 				});
 			}
 
+			const previewDeploymentsList =
+				await findPreviewDeploymentsByApplicationId(input.applicationId);
+
+			for (const previewDeployment of previewDeploymentsList) {
+				try {
+					await removePreviewDeployment(previewDeployment.previewDeploymentId);
+				} catch (_) {}
+			}
+
 			const result = await db
 				.delete(applications)
 				.where(eq(applications.applicationId, input.applicationId))
 				.returning();
 
 			if (!IS_CLOUD) {
-				const queueJobs = await getJobsByApplicationId(input.applicationId);
-				for (const job of queueJobs) {
-					if (job.id) {
-						deploymentWorker.cancelJob(job.id, "User requested cancellation");
-					}
-				}
+				await cleanQueuesByApplication(input.applicationId);
 			}
 
 			const cleanupOperations = [
@@ -324,10 +457,10 @@ export const applicationRouter = createTRPCRouter({
 				type: "redeploy",
 				applicationType: "application",
 				server: !!application.serverId,
+				serverId: application.serverId ?? undefined,
 			};
 
 			if (IS_CLOUD && application.serverId) {
-				jobData.serverId = application.serverId;
 				deploy(jobData).catch((error) => {
 					console.error("Background deployment failed:", error);
 				});
@@ -412,7 +545,6 @@ export const applicationRouter = createTRPCRouter({
 				sourceType: "github",
 				owner: input.owner,
 				buildPath: input.buildPath,
-				applicationStatus: "idle",
 				githubId: input.githubId,
 				watchPaths: input.watchPaths,
 				triggerType: input.triggerType,
@@ -439,7 +571,6 @@ export const applicationRouter = createTRPCRouter({
 				gitlabBranch: input.gitlabBranch,
 				gitlabBuildPath: input.gitlabBuildPath,
 				sourceType: "gitlab",
-				applicationStatus: "idle",
 				gitlabId: input.gitlabId,
 				gitlabProjectId: input.gitlabProjectId,
 				gitlabPathNamespace: input.gitlabPathNamespace,
@@ -468,7 +599,6 @@ export const applicationRouter = createTRPCRouter({
 				bitbucketBranch: input.bitbucketBranch,
 				bitbucketBuildPath: input.bitbucketBuildPath,
 				sourceType: "bitbucket",
-				applicationStatus: "idle",
 				bitbucketId: input.bitbucketId,
 				watchPaths: input.watchPaths,
 				enableSubmodules: input.enableSubmodules,
@@ -494,7 +624,6 @@ export const applicationRouter = createTRPCRouter({
 				giteaBranch: input.giteaBranch,
 				giteaBuildPath: input.giteaBuildPath,
 				sourceType: "gitea",
-				applicationStatus: "idle",
 				giteaId: input.giteaId,
 				watchPaths: input.watchPaths,
 				enableSubmodules: input.enableSubmodules,
@@ -519,7 +648,6 @@ export const applicationRouter = createTRPCRouter({
 				username: input.username,
 				password: input.password,
 				sourceType: "docker",
-				applicationStatus: "idle",
 				registryUrl: input.registryUrl,
 			});
 			const application = await findApplicationById(input.applicationId);
@@ -543,7 +671,6 @@ export const applicationRouter = createTRPCRouter({
 				customGitUrl: input.customGitUrl,
 				customGitSSHKeyId: input.customGitSSHKeyId,
 				sourceType: "git",
-				applicationStatus: "idle",
 				watchPaths: input.watchPaths,
 				enableSubmodules: input.enableSubmodules,
 			});
@@ -596,7 +723,6 @@ export const applicationRouter = createTRPCRouter({
 				customGitSSHKeyId: null,
 
 				sourceType: "github", // Reset to default
-				applicationStatus: "idle",
 				watchPaths: null,
 				enableSubmodules: false,
 			});
@@ -630,6 +756,17 @@ export const applicationRouter = createTRPCRouter({
 			await checkServicePermissionAndAccess(ctx, input.applicationId, {
 				service: ["create"],
 			});
+
+			if (input.buildServerId) {
+				const accessibleIds = await getAccessibleServerIds(ctx.session);
+				if (!accessibleIds.has(input.buildServerId)) {
+					throw new TRPCError({
+						code: "UNAUTHORIZED",
+						message: "You are not authorized to access this build server",
+					});
+				}
+			}
+
 			const { applicationId, ...rest } = input;
 			const updateApp = await updateApplication(applicationId, {
 				...rest,
@@ -681,9 +818,9 @@ export const applicationRouter = createTRPCRouter({
 				type: "deploy",
 				applicationType: "application",
 				server: !!application.serverId,
+				serverId: application.serverId ?? undefined,
 			};
 			if (IS_CLOUD && application.serverId) {
-				jobData.serverId = application.serverId;
 				deploy(jobData).catch((error) => {
 					console.error("Background deployment failed:", error);
 				});
@@ -800,9 +937,9 @@ export const applicationRouter = createTRPCRouter({
 				type: "deploy",
 				applicationType: "application",
 				server: !!app.serverId,
+				serverId: app.serverId ?? undefined,
 			};
 			if (IS_CLOUD && app.serverId) {
-				jobData.serverId = app.serverId;
 				deploy(jobData).catch((error) => {
 					console.error("Background deployment failed:", error);
 				});
@@ -1078,5 +1215,40 @@ export const applicationRouter = createTRPCRouter({
 				items,
 				total: countResult[0]?.count ?? 0,
 			};
+		}),
+
+	readLogs: protectedProcedure
+		.input(
+			apiFindOneApplication.extend({
+				tail: z.number().int().min(1).max(10000).default(100),
+				since: z
+					.string()
+					.regex(/^(all|\d+[smhd])$/, "Invalid since format")
+					.default("all"),
+				search: z
+					.string()
+					.regex(/^[a-zA-Z0-9 ._-]{0,500}$/)
+					.optional(),
+			}),
+		)
+		.query(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.applicationId, "read");
+			const application = await findApplicationById(input.applicationId);
+			if (
+				application.environment.project.organizationId !==
+				ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to access this application",
+				});
+			}
+			return await getContainerLogs(
+				application.appName,
+				input.tail,
+				input.since,
+				input.search,
+				application.serverId,
+			);
 		}),
 });
